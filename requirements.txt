@@ -1,0 +1,5 @@
+langchain==0.1.16
+langchain-community==0.0.35
+langchain-openai==0.1.5
+psycopg2-binary
+python-dotenv==1.0.1
