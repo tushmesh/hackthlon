@@ -53,12 +53,12 @@ json_data = [
     {
         "id": 2,
         "business_question": "I want to buy the 'Choco Milk Pack' from the 'FreshFarm', where I can find it? ",
-        "business_query": "SELECT Area FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
+        "business_query": "SELECT Location FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
     },
     {
         "id": 3,
         "business_question": "Can you please show the Nutri Score of this item?",
-        "business_query": "SELECT Area FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
+        "business_query": "SELECT Location FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
     },
     {
         "id": 4,
@@ -68,7 +68,7 @@ json_data = [
     {
         "id": 5,
         "business_question": "Can you please show me the item I should by to cook the pizza and the information about the are where I should find them?",
-        "business_query": "SELECT ItemName, smi.Category, Brand, Price, Area FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Pizza%'"
+        "business_query": "SELECT ItemName, smi.Category, Brand, Price, Location FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Pizza%'"
     },
     {
         "id": 6,
@@ -270,7 +270,7 @@ SupermarketItems	StockQuantity	int	Number of units available.
 SupermarketItems	ExpiryDate	date	Expiration date.
 SupermarketItems	Supplier	nvarchar(100)	Supplier name.
 SupermarketItems	Allergy	nvarchar(50)	Allergy info (e.g., Nuts, Gluten).
-SupermarketItems	Area	nvarchar(50)	Store section where the item is found.
+SupermarketItems	Location	nvarchar(50)	Store section where the item is found.
 SupermarketItems	NutriScore	nvarchar(5)	Nutritional score (e.g., A to E).
 SupermarketItems	SalesPerMonth	int	Number of units sold per month.
 
@@ -314,7 +314,7 @@ CREATE TABLE [dbo].[SupermarketItems](
 	[ExpiryDate] [date] NULL,
 	[Supplier] [nvarchar](100) NULL,
 	[Allergy] [nvarchar](50) NULL,
-	[Area] [nvarchar](50) NULL,
+	[Location] [nvarchar](50) NULL,
 	[NutriScore] [nvarchar](5) NULL,
 	[SalesPerMonth] [int] NULL
 ) ON [PRIMARY]
