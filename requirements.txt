@@ -8,3 +8,4 @@ langchain
 langchain-ollama
 redis
 redisearch
+pyodbc
