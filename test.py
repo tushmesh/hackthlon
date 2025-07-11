@@ -26,23 +26,27 @@ VECTOR_DIMENSIONS = 1024
 INDEX_NAME = "story_index"
 DOC_PREFIX = "business_question:"
 
-server = 'tcp:sql404server.database.windows.net,1433'
+server = 'sql404server.database.windows.net'
 database = 'SupermarketDB'
 username = 'odl_user_1782423@cloudlabssandbox.onmicrosoft.com'
 password = 'hawu90KBV*NX'
+port = 1433
+driver = '{ODBC Driver 17 for SQL Server}'
 
 # Connection string
-connection_string = (
-    f"Driver={{ODBC Driver 18 for SQL Server}};"
-    f"Server={server};"
-    f"Database={database};"
-    f"Uid={username};"
-    f"Pwd={password};"
-    f"Encrypt=yes;"
-    f"TrustServerCertificate=no;"
-    f"Connection Timeout=30;"
-    f"Authentication=ActiveDirectoryPassword;"
-)
+connection_string = f"""
+    Driver={driver};
+    Server={server};
+    Database={database};
+    UID={username};
+    PWD={password};
+    Authentication=ActiveDirectoryPassword;
+    Encrypt=yes;
+    TrustServerCertificate=no;
+    HostNameInCertificate=*.database.windows.net;
+    LoginTimeout=30;
+"""
+
 
 json_data = [
     {
