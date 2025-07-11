@@ -400,8 +400,8 @@ GO
 
 prompt = PromptTemplate(template=template, input_variables=["question", "business_question"])
 # Initialize the OpenAI language model with specified settings
-#llm = OllamaLLM(model="llama3:8b")
-llm = OllamaLLM(model="deepseek-v2")
+llm = OllamaLLM(model="llama3.2")
+#llm = OllamaLLM(model="deepseek-v2")
 
 # Create an LLMChain with the prompt and language model
 chain = prompt | llm
@@ -487,11 +487,11 @@ Answer:
 prompt = PromptTemplate(template=template, input_variables=["question", "data"])
 
 # Initialize the OpenAI language model with specified settings
-#deepseek = OllamaLLM(model="deepseek-r1:1.5b")
-deepseek = OllamaLLM(model="deepseek-v2") 
+deepseek = OllamaLLM(model="llama3.2")
+#deepseek = OllamaLLM(model="deepseek-v2") 
 # Create an LLMChain with the prompt and language model
 chain = prompt | deepseek
 
 output = chain.invoke({"question": question , "data": data})
 
-print("deepseek-v2-->", output) 
+print("llama3.2-->", output) 
