@@ -1,0 +1,631 @@
+"""
+Refactored backend code for a grocery shop concierge service.
+This script connects to a SQL Server database, uses Redis for vector search,
+and leverages Ollama LLMs for SQL query generation and conversational responses.
+"""
+
+import orjson
+import json
+import time
+from typing import List, Dict, Any
+import numpy as np
+import pandas as pd
+import requests
+import re
+import pyodbc
+from getpass import getpass
+
+from sentence_transformers import SentenceTransformer
+from langchain_ollama import OllamaLLM
+from langchain_ollama import OllamaEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+import redis
+from redis.commands.search.field import TagField, VectorField, NumericField, TextField
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+from redis.commands.search.query import Query
+
+# --- Configuration Constants ---
+VECTOR_DIMENSIONS = 1024
+INDEX_NAME = "story_index"
+DOC_PREFIX = "business_question:"
+
+# Database connection details (replace with secure environment variables in production)
+DB_SERVER = 'sql404server.database.windows.net'
+DB_DATABASE = 'SupermarketDB'
+DB_USERNAME = 'odl_user_1782423@cloudlabssandbox.onmicrosoft.com'
+DB_PASSWORD = 'hawu90KBV*NX'
+DB_PORT = 1433
+DB_DRIVER = '{ODBC Driver 17 for SQL Server}'
+
+# Redis connection details (replace with secure environment variables in production)
+REDIS_HOST = "redis-18805.c282.east-us-mz.azure.redns.redis-cloud.com"
+REDIS_PORT = 18805
+REDIS_PASSWORD = "xB9B1BtFHxu1CvzNoRlE5yiIy3N0fpD1"
+
+# --- Data Definitions ---
+# This JSON data represents predefined business questions and their corresponding SQL queries.
+# In a real-world scenario, this might be loaded from a database or a configuration file.
+BUSINESS_QUESTIONS_DATA = [
+    {
+        "id": 1,
+        "business_question": "Which are the gluten free products present in the store and the price?",
+        "business_query": "SELECT ItemName, Category, Brand, Price FROM [dbo].[SupermarketItems] WHERE allergy like '%gluten free%'"
+    },
+    {
+        "id": 2,
+        "business_question": "I want to buy the 'Choco Milk Pack' from the 'FreshFarm', where I can find it? ",
+        "business_query": "SELECT Location FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
+    },
+    {
+        "id": 3,
+        "business_question": "Can you please show the Nutri Score of this item?",
+        "business_query": "SELECT Location FROM [dbo].[SupermarketItems] WHERE ItemName = 'Choco Milk Pack' AND Brand = 'FreshFarm'"
+    },
+    {
+        "id": 4,
+        "business_question": "Can you please show me the receipe for a Pizza?",
+        "business_query": "SELECT IngredientName, Quantity, RecipeName FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Pizza%'"
+    },
+    {
+        "id": 5,
+        "business_question": "Can you please show me the item I should by to cook the pizza and the information about the are where I should find them?",
+        "business_query": "SELECT ItemName, smi.Category, Brand, Price, Location FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Pizza%'"
+    },
+    {
+        "id": 6,
+        "business_question": "What is the cost of this recipe?",
+        "business_query": "SELECT SUM(Price) FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Pizza%'"
+    },
+    {
+        "id": 7,
+        "business_question": "Can you please show me the receipe for a Bolognese?",
+        "business_query": "SELECT IngredientName, Quantity, RecipeName FROM [dbo].[Ingredients] as ing INNER JOIN [dbo].[Recipes] as rec ON ing.RecipeID = rec.RecipeID INNER JOIN [dbo].[SupermarketItems] as smi ON smi.ItemName = ing.IngredientName where rec.RecipeName like '%Bolognese%'"
+    },
+    {
+        "id": 8,
+        "business_question": "Can you show me the instruction to cook Bolognese?",
+        "business_query": "SELECT StepNumber, StepDescription  FROM [dbo].[Instructions] inst INNER JOIN [dbo].[Recipes] as rec ON inst.RecipeID = rec.RecipeID where rec.RecipeName like '%Bolognese%' ORDER BY StepNumber ASC"
+    },
+    {
+        "id": 9,
+        "business_question": "Please show me the products with NutriScore 'A'",
+        "business_query": "SELECT ItemName, Brand, NutriScore FROM [dbo].[SupermarketItems] WHERE NutriScore = 'A'"
+    },
+    {
+        "id": 10,
+        "business_question": "Show me the the less expensive item with Nutriscore A",
+        "business_query": "SELECT ItemName, Brand, NutriScore, Price FROM [dbo].[SupermarketItems] WHERE NutriScore = 'A' ORDER BY Price ASC"
+    },
+    {
+        "id": 11,
+        "business_question": "Can you give me the list of most selled product with Nutriscore 'A'?",
+        "business_query": "SELECT TOP 5  ItemName, Brand, NutriScore, Price FROM [dbo].[SupermarketItems] WHERE NutriScore = 'A' ORDER BY SalesPerMonth DESC"
+    }
+]
+
+# --- Helper Functions ---
+
+def get_db_connection_string() -> str:
+    """Constructs and returns the database connection string."""
+    return f"""
+        Driver={DB_DRIVER};
+        Server={DB_SERVER},{DB_PORT};
+        Database={DB_DATABASE};
+        UID={DB_USERNAME};
+        PWD={DB_PASSWORD};
+        Authentication=ActiveDirectoryPassword;
+        Encrypt=yes;
+        TrustServerCertificate=no;
+        HostNameInCertificate=*.database.windows.net;
+        LoginTimeout=30;
+    """
+
+def extract_sql_query_from_llm_output(text: str) -> str | None:
+    """
+    Extracts the first SQL query enclosed in ```sql\n...\n``` from the given text.
+    Args:
+        text (str): The input text from the LLM.
+    Returns:
+        str | None: The extracted SQL query or None if not found.
+    """
+    pattern = r'```sql\n(.*?)```'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        return matches[0].strip()
+    return None
+
+# --- Classes ---
+
+class RedisVectorStore:
+    """
+    Manages connection and operations with a Redis vector database.
+    Handles index creation, data ingestion, and vector search.
+    """
+    def __init__(self, host: str, port: int, password: str, index_name: str, doc_prefix: str):
+        self.client = redis.Redis(host=host, port=port, password=password, decode_responses=True)
+        self.index_name = index_name
+        self.doc_prefix = doc_prefix
+        self.embeddings_model = OllamaEmbeddings(model="mxbai-embed-large") # Initialize embedding model here
+
+    def _check_connection(self):
+        """Pings Redis to check connection."""
+        try:
+            res = self.client.ping()
+            print(f"Redis ping: {res}")
+            if not res:
+                raise ConnectionError("Failed to connect to Redis.")
+        except redis.exceptions.ConnectionError as e:
+            print(f"Redis connection error: {e}")
+            raise
+
+    def create_index(self, vector_dimensions: int):
+        """
+        Creates a RediSearch index for vector similarity search if it doesn't exist.
+        Args:
+            vector_dimensions (int): The dimension of the embeddings.
+        """
+        self._check_connection()
+        try:
+            self.client.ft(self.index_name).info()
+            print(f"Index '{self.index_name}' already exists!")
+        except Exception: # RediSearch throws an exception if index doesn't exist
+            schema = (
+                NumericField('id'),
+                TextField('business_question'),
+                TextField('business_query'),
+                VectorField('embedding',
+                    'FLAT', {
+                    "TYPE": "FLOAT32",
+                    "DIM": vector_dimensions,
+                    "DISTANCE_METRIC": "COSINE"
+                })
+            )
+            definition = IndexDefinition(prefix=[self.doc_prefix], index_type=IndexType.HASH)
+            self.client.ft(self.index_name).create_index(fields=schema, definition=definition)
+            print(f"Index '{self.index_name}' created successfully.")
+
+    def ingest_data(self, data: List[Dict[str, Any]]):
+        """
+        Ingests data into Redis, generating embeddings for business questions.
+        Args:
+            data (List[Dict[str, Any]]): A list of dictionaries, each containing
+                                         'id', 'business_question', and 'business_query'.
+        """
+        self._check_connection()
+        print("Ingesting data into Redis...")
+        pipe = self.client.pipeline()
+        for obj in data:
+            key = f"{self.doc_prefix}{obj['id']}"
+            # Generate embeddings for the business question
+            embeddings = self.embeddings_model.embed_documents(obj['business_question'])[0]
+            obj["embedding"] = np.array(embeddings, dtype=np.float32).tobytes()
+            pipe.hset(key, mapping=obj)
+        res = pipe.execute()
+        print(f"Ingested {len(res)} documents into Redis.")
+
+    def search_similar_questions(self, user_question: str, top_k: int = 6) -> List[Any]:
+        """
+        Performs a vector similarity search in Redis to find similar business questions.
+        Args:
+            user_question (str): The question asked by the user.
+            top_k (int): The number of top similar results to retrieve.
+        Returns:
+            List[Any]: A list of search results from Redis.
+        """
+        self._check_connection()
+        print(f"Searching for similar questions to: '{user_question}'")
+        user_question_embedding = self.embeddings_model.embed_documents(user_question)[0]
+        
+        query = Query(f"(*)=>[KNN {top_k} @embedding $vec AS score]") \
+            .return_fields("id", "business_question", "business_query", "score") \
+            .sort_by("score") \
+            .dialect(2) \
+            .paging(0, top_k)
+        
+        query_params = {"vec": np.array(user_question_embedding, dtype=np.float32).tobytes()}
+        
+        results = self.client.ft(self.index_name).search(query, query_params).docs
+        print(f"Found {len(results)} similar questions.")
+        return results
+
+class SQLDatabaseManager:
+    """
+    Manages connections and queries to the SQL Server database.
+    """
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self.conn = None
+
+    def _get_connection(self):
+        """Establishes and returns a database connection."""
+        if self.conn is None or not self._is_connection_valid():
+            try:
+                self.conn = pyodbc.connect(self.connection_string)
+                print("Database connection established.")
+            except pyodbc.Error as e:
+                print(f"Error connecting to database: {e}")
+                raise
+        return self.conn
+
+    def _is_connection_valid(self) -> bool:
+        """Checks if the current database connection is valid."""
+        try:
+            if self.conn:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT 1") # Simple query to check connection
+                return True
+            return False
+        except pyodbc.Error:
+            return False
+
+    def execute_query(self, query: str) -> List[Any]:
+        """
+        Executes a given SQL query and returns the results.
+        Args:
+            query (str): The SQL query to execute.
+        Returns:
+            List[Any]: A list of rows returned by the query.
+        """
+        rows = []
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            print(f"Query executed successfully. Rows returned: {len(rows)}")
+        except pyodbc.Error as e:
+            print(f"Error executing SQL query: {e}")
+            raise
+        finally:
+            # It's generally better to close connections when they are no longer needed,
+            # or manage them via a connection pool for a web service.
+            # For this example, we'll keep it simple and close after each operation.
+            if self.conn:
+                self.conn.close()
+                self.conn = None # Reset connection to force re-establishment on next call
+                print("Database connection closed.")
+        return rows
+
+class LLMService:
+    """
+    Handles interactions with Ollama LLMs for SQL query generation and
+    conversational responses.
+    """
+    def __init__(self, sql_llm_model: str = "llama3.2", chat_llm_model: str = "llama3.2"):
+        self.sql_llm = OllamaLLM(model=sql_llm_model)
+        self.chat_llm = OllamaLLM(model=chat_llm_model)
+        self.sql_prompt_template = self._get_sql_prompt_template()
+        self.chat_prompt_template = self._get_chat_prompt_template()
+
+    def _get_sql_prompt_template(self) -> PromptTemplate:
+        """Defines the prompt template for SQL query generation."""
+        template = """
+You are a Postgres expert. 
+Generate a SQL query to answer the {question}. 
+Your response must be based only on the provided context and must strictly follow the response guidelines and format instructions.
+=== Response Guidelines
+Return ONLY the SQL query. Do not include any instructions, explanations, comments, or additional details or lines in the output.
+If the provided context is sufficient, generate a valid SQL query without any explanations, comments, or additional text.
+
+When the query: {query} is not None, it means that the query execution throw this kind of {exception}  in the previous query generation.. use this information to generate again the correct query
+.
+If the context is insufficient to generate a query, explain briefly why and conclude with: Decision: insufficient.
+
+When questions are phrased differently but have the same intent, rephrase the question to match the available data context and generate the query. 
+If context is still lacking, indicate insufficient context clearly.
+
+Use the most relevant table(s) available.
+
+Leverage previous conversations and context to craft an accurate response.
+
+Ensure the SQL is postgres-compliant, executable, and free of syntax errors.
+
+Do not generate any DDL or DML queries.
+
+If a similar question was asked before and a query was provided, use that query if applicable.
+
+Do not prepend or append any string or phrase to the SQL. The output must be the raw SQL only.
+
+You use COUNT(DISTINCT column) instead of COUNT(column) unless it is certain that duplicates are not possible or desired.
+
+
+===Additional Context
+
+The following details are for the "SupermarketItems" table in the  schema:
+
+Table Name	Column Name	Data Type	Description
+SupermarketItems	ID	nvarchar(10)	Unique item ID (not primary key).
+SupermarketItems	ItemName	nvarchar(255)	Name of the supermarket item.
+SupermarketItems	Category	nvarchar(100)	Category (e.g., Dairy, Produce).
+SupermarketItems	Brand	nvarchar(100)	Brand name of the item.
+SupermarketItems	Price	float	Price of the item.
+SupermarketItems	StockQuantity	int	Number of units available.
+SupermarketItems	ExpiryDate	date	Expiration date.
+SupermarketItems	Supplier	nvarchar(100)	Supplier name.
+SupermarketItems	Allergy	nvarchar(50)	Allergy info (e.g., Nuts, Gluten).
+SupermarketItems	Location	nvarchar(50)	Store section where the item is found.
+SupermarketItems	NutriScore	nvarchar(5)	Nutritional score (e.g., A to E).
+SupermarketItems	SalesPerMonth	int	Number of units sold per month.
+
+The following details are for the "Recipes" table in the  schema:
+Table Name	Column Name	Data Type	Description
+Recipes	RecipeID	int	Unique ID for the recipe. Primary Key.
+Recipes	RecipeName	nvarchar(100)	Name of the recipe.
+Recipes	Description	nvarchar(255)	Short recipe description.
+Recipes	Category	nvarchar(50)	Recipe category (e.g., Dessert, Vegan).
+
+The following details are for the "Instructions" table in the  schema:
+Table Name	Column Name	Data Type	Description
+Instructions	InstructionID	int	Unique ID for each instruction. Primary Key.
+Instructions	RecipeID	int	Linked recipe ID. Foreign Key → Recipes(RecipeID).
+Instructions	StepNumber	int	Order of the instruction step.
+Instructions	StepDescription	nvarchar(500)	Description of what to do in that step.
+
+The following details are for the "Ingredients" table in the  schema:
+Table Name	Column Name	Data Type	Description
+Ingredients	IngredientID	int	Unique ID for each ingredient. Primary Key.
+Ingredients	RecipeID	int	Linked recipe ID. Foreign Key → Recipes(RecipeID).
+Ingredients	IngredientName	nvarchar(100)	Name of the ingredient.
+Ingredients	Quantity	nvarchar(100)	Quantity (e.g., "2 cups", "100g").
+
+
+here the schema of "SupermarketItems":
+/****** Object:  Table [dbo].[SupermarketItems]    Script Date: 09/07/2025 12:12:54 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[SupermarketItems](
+	[ID] [nvarchar](10) NULL,
+	[ItemName] [nvarchar](255) NULL,
+	[Category] [nvarchar](100) NULL,
+	[Brand] [nvarchar](100) NULL,
+	[Price] [float] NULL,
+	[StockQuantity] [int] NULL,
+	[ExpiryDate] [date] NULL,
+	[Supplier] [nvarchar](100) NULL,
+	[Allergy] [nvarchar](50) NULL,
+	[Location] [nvarchar](50) NULL,
+	[NutriScore] [nvarchar](5) NULL,
+	[SalesPerMonth] [int] NULL
+) ON [PRIMARY]
+GO
+
+here the schema of "Recipes":
+/****** Object:  Table [dbo].[Recipes]    Script Date: 09/07/2025 12:12:45 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[Recipes](
+	[RecipeID] [int] IDENTITY(1,1) NOT NULL,
+	[RecipeName] [nvarchar](100) NULL,
+	[Description] [nvarchar](255) NULL,
+	[Category] [nvarchar](50) NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[RecipeID] ASC
+)WITH (STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+here the schema of "Instructions":
+/****** Object:  Table [dbo].[Instructions]    Script Date: 09/07/2025 12:12:37 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[Instructions](
+	[InstructionID] [int] IDENTITY(1,1) NOT NULL,
+	[RecipeID] [int] NULL,
+	[StepNumber] [int] NULL,
+	[StepDescription] [nvarchar](500) NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[InstructionID] ASC
+)WITH (STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+ALTER TABLE [dbo].[Instructions]  WITH CHECK ADD FOREIGN KEY([RecipeID])
+REFERENCES [dbo].[Recipes] ([RecipeID])
+GO
+
+here the schema of "Ingredients":
+/****** Object:  Table [dbo].[Ingredients]    Script Date: 09/07/2025 12:12:26 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE TABLE [dbo].[Ingredients](
+	[IngredientID] [int] IDENTITY(1,1) NOT NULL,
+	[RecipeID] [int] NULL,
+	[IngredientName] [nvarchar](100) NULL,
+	[Quantity] [nvarchar](100) NULL,
+PRIMARY KEY CLUSTERED 
+(
+	[IngredientID] ASC
+)WITH (STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY]
+GO
+
+ALTER TABLE [dbo].[Ingredients]  WITH CHECK ADD FOREIGN KEY([RecipeID])
+REFERENCES [dbo].[Recipes] ([RecipeID])
+GO
+
+
+===here the list of user question and relative query that you can use as examples to generate the right query:
+{business_question}
+        """
+        return PromptTemplate(template=template, input_variables=["question", "business_question", "exception", "query"])
+
+    def _get_chat_prompt_template(self) -> PromptTemplate:
+        """Defines the prompt template for conversational responses."""
+        template = """
+You are an concierge of a Grocery Shop and you provide an answer to all irrespective of their age.
+=== Response Guidelines
+Always answer in a kind and friendly language. 
+Make the answer in such a way that it feels like a conversational language for all types of peoples, especially elder peoples.
+Answer in the precise and in a simple sentences and in a natural language
+Do NOT print in the output <think> </think> content , strictly just provide an answer 
+Answer the question clearly and directly. Do not include any internal thoughts or <think> tags.
+Also answer in such a way that, the text i.e answer can be translted to Speech.
+Question: {question} 
+[Oread this information: {data} answer to this question.
+Please provide an answer thet is shorter as possible.
+Please use only the data which is been provided to answer the question. 
+
+Answer:  
+        """
+        return PromptTemplate(template=template, input_variables=["question", "data"])
+
+    def generate_sql_query(self, question: str, business_question_context: str, previous_query: str = None, previous_exception: str = None) -> str:
+        """
+        Generates a SQL query based on the user's question and business context.
+        Args:
+            question (str): The user's natural language question.
+            business_question_context (str): Context from similar business questions.
+            previous_query (str, optional): The previously attempted query, if any.
+            previous_exception (str, optional): The exception from the previous query, if any.
+        Returns:
+            str: The generated SQL query.
+        """
+        sql_chain = self.sql_prompt_template | self.sql_llm
+        output = sql_chain.invoke({
+            "question": question,
+            "business_question": business_question_context,
+            "exception": previous_exception,
+            "query": previous_query
+        })
+        return extract_sql_query_from_llm_output(output)
+
+    def generate_chat_response(self, question: str, data: List[Any]) -> str:
+        """
+        Generates a conversational response based on the user's question and query results.
+        Args:
+            question (str): The user's natural language question.
+            data (List[Any]): The data retrieved from the database.
+        Returns:
+            str: The conversational response.
+        """
+        chat_chain = self.chat_prompt_template | self.chat_llm
+        output = chat_chain.invoke({"question": question, "data": str(data)})
+        return output
+
+# --- Main Application Logic ---
+
+class GroceryConciergeApp:
+    """
+    Main application class orchestrating the interactions between
+    Redis, SQL database, and LLM services.
+    """
+    def __init__(self):
+        self.redis_store = RedisVectorStore(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            password=REDIS_PASSWORD,
+            index_name=INDEX_NAME,
+            doc_prefix=DOC_PREFIX
+        )
+        self.db_manager = SQLDatabaseManager(get_db_connection_string())
+        self.llm_service = LLMService()
+
+    def initialize_backend(self):
+        """Initializes Redis index and ingests initial data."""
+        print("Initializing backend...")
+        # Flush all data in Redis (use with caution in production)
+        try:
+            self.redis_store.client.flushall()
+            print("All data in Redis have been cleared.")
+        except Exception as e:
+            print(f"Could not flush Redis: {e}. Continuing anyway.")
+
+        self.redis_store.create_index(vector_dimensions=VECTOR_DIMENSIONS)
+        self.redis_store.ingest_data(BUSINESS_QUESTIONS_DATA)
+        print("Backend initialization complete.")
+
+    def process_user_question(self, user_question: str) -> str:
+        """
+        Processes a user's question by:
+        1. Finding similar business questions in Redis.
+        2. Generating a SQL query using an LLM.
+        3. Executing the SQL query against the database.
+        4. Generating a conversational response using another LLM.
+        Args:
+            user_question (str): The natural language question from the user.
+        Returns:
+            str: The conversational answer to the user's question.
+        """
+        print(f"\n--- Processing User Question: '{user_question}' ---")
+        
+        # Step 1: Find similar business questions
+        similar_questions_results = self.redis_store.search_similar_questions(user_question)
+        business_question_context = str(similar_questions_results)
+
+        sql_query = None
+        db_results = []
+        exception_message = None
+        
+        # Step 2 & 3: Generate and execute SQL query (with retry logic)
+        max_retries = 3
+        for attempt in range(max_retries):
+            print(f"Attempt {attempt + 1} to generate and execute SQL query...")
+            try:
+                generated_sql = self.llm_service.generate_sql_query(
+                    question=user_question,
+                    business_question_context=business_question_context,
+                    previous_query=sql_query, # Pass previous query for re-generation
+                    previous_exception=exception_message # Pass previous exception for re-generation
+                )
+                
+                if not generated_sql:
+                    print("LLM did not generate a valid SQL query.")
+                    exception_message = "LLM failed to generate a valid SQL query."
+                    continue # Try again if LLM didn't produce SQL
+
+                print(f"Generated SQL: {generated_sql}")
+                sql_query = generated_sql # Store for potential retry
+                
+                db_results = self.db_manager.execute_query(sql_query)
+                print("SQL query executed successfully.")
+                break # Exit loop if successful
+            except Exception as e:
+                exception_message = str(e)
+                print(f"SQL execution failed: {exception_message}")
+                if attempt == max_retries - 1:
+                    print("Max retries reached for SQL query generation/execution.")
+                    # If all retries fail, return an error message to the user
+                    return "I apologize, but I encountered an issue while trying to retrieve that information. Please try rephrasing your question."
+        
+        # Step 4: Generate conversational response
+        final_answer = self.llm_service.generate_chat_response(user_question, db_results)
+        print(f"Final Answer: {final_answer}")
+        return final_answer
+
+# --- Entry Point for Backend Service (Example Usage) ---
+if __name__ == "__main__":
+    app = GroceryConciergeApp()
+    app.initialize_backend()
+
+    # Example usage:
+    # You would typically expose `process_user_question` via a web framework (e.g., Flask, FastAPI)
+    # for a frontend to interact with.
+
+    while True:
+        user_input = input("\nAsk me a question about the grocery store (type 'exit' to quit): ")
+        if user_input.lower() == 'exit':
+            break
+        
+        response = app.process_user_question(user_input)
+        print(f"Concierge: {response}")
+
+
