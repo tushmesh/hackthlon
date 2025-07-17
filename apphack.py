@@ -86,8 +86,8 @@ client_contexts = {}  # Client contexts
 speech_token = None  # Speech token
 ice_token = None  # ICE token
 
-# --- NEW: Initialize your GroceryConciergeApp instance globally ---
-grocery_concierge_app = None
+# --- REMOVED: Global initialization of GroceryConciergeApp ---
+# grocery_concierge_app = None
 
 # Original AzureOpenAI client - keep if needed for other features, otherwise remove
 if azure_openai_endpoint and azure_openai_api_key:
@@ -104,32 +104,32 @@ if enable_vad and enable_websockets:
     vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
     vad_iterator = VADIterator(model=vad_model, threshold=0.5, sampling_rate=16000, min_silence_duration_ms=150, speech_pad_ms=100)
 
-# --- NEW: Function to initialize the GroceryConciergeApp ---
-def initialize_grocery_concierge():
-    global grocery_concierge_app
-    if grocery_concierge_app is None:
-        grocery_concierge_app = GroceryConciergeApp()
-        grocery_concierge_app.initialize_backend()
-        print("GroceryConciergeApp backend initialized.")
+# --- REMOVED: Function to initialize the GroceryConciergeApp globally ---
+# def initialize_grocery_concierge():
+#     global grocery_concierge_app
+#     if grocery_concierge_app is None:
+#         grocery_concierge_app = GroceryConciergeApp()
+#         grocery_concierge_app.initialize_backend()
+#         print("GroceryConciergeApp backend initialized.")
 
 # The default route, which shows the default web page (basic.html)
 @app.route("/")
 def index():
-    initialize_grocery_concierge() # Ensure backend is initialized on first request
+    # REMOVED: Call to global initialize_grocery_concierge
     return render_template("basic.html", methods=["GET"], client_id=initializeClient())
 
 
 # The basic route, which shows the basic web page
 @app.route("/basic")
 def basicView():
-    initialize_grocery_concierge() # Ensure backend is initialized
+    # REMOVED: Call to global initialize_grocery_concierge
     return render_template("basic.html", methods=["GET"], client_id=initializeClient())
 
 
 # The chat route, which shows the chat web page
 @app.route("/chat")
 def chatView():
-    initialize_grocery_concierge() # Ensure backend is initialized
+    # REMOVED: Call to global initialize_grocery_concierge
     return render_template("chat.html", methods=["GET"], client_id=initializeClient(), enable_websockets=enable_websockets)
 
 
@@ -376,16 +376,8 @@ def connectSTT() -> Response:
                         client_context['chat_initiated'] = True
                     first_response_chunk = True
                     
-                    # --- MODIFIED: Call your GroceryConciergeApp for response ---
-                    # The original handleUserQuery was a generator, yielding chunks.
-                    # Your new backend returns a complete string.
-                    # Adjust this part based on how you want to stream/display the response.
-                    
-                    # For simplicity, we'll get the full response and then yield it as one chunk.
-                    # If you want streaming, you'd need to modify process_user_question
-                    # to be a generator as well.
-                    
-                    concierge_response = grocery_concierge_app.process_user_question(user_query)
+                    # --- MODIFIED: Call your client-specific GroceryConciergeApp for response ---
+                    concierge_response = client_context['grocery_concierge_instance'].process_user_question(user_query)
                     
                     if first_response_chunk:
                         socketio.emit("response", {'path': 'api.chat', 'chatResponse': 'Assistant: '}, room=client_id)
@@ -458,11 +450,8 @@ def chat() -> Response:
         client_context['chat_initiated'] = True
     user_query = request.data.decode('utf-8')
     
-    # --- MODIFIED: Call your GroceryConciergeApp for response ---
-    # This endpoint now returns the full response from your backend.
-    # If you need streaming for this HTTP endpoint, you'd need to adapt
-    # process_user_question to yield chunks.
-    concierge_response = grocery_concierge_app.process_user_question(user_query)
+    # --- MODIFIED: Call your client-specific GroceryConciergeApp for response ---
+    concierge_response = client_context['grocery_concierge_instance'].process_user_question(user_query)
     # Speak the response
     try:
         speakWithQueue(concierge_response, 0, client_id)
@@ -491,7 +480,11 @@ def continueSpeaking() -> Response:
 def clearChatHistory() -> Response:
     client_id = uuid.UUID(request.headers.get('ClientId'))
     client_context = client_contexts[client_id]
-    initializeChatContext(request.headers.get('SystemPrompt'), client_id)
+    # To clear the chat history for a specific client, we'll reset its GroceryConciergeApp instance's history.
+    # Note: If initializeChatContext also manages this, ensure it's consistent.
+    if 'grocery_concierge_instance' in client_context:
+        client_context['grocery_concierge_instance'].chat_history.clear() # Clear backend history
+    initializeChatContext(request.headers.get('SystemPrompt'), client_id) # This clears client-side 'messages'
     client_context['chat_initiated'] = True
     return Response('Chat history cleared.', status=200)
 
@@ -514,6 +507,9 @@ def releaseClient() -> Response:
     try:
         disconnectAvatarInternal(client_id, False)
         disconnectSttInternal(client_id)
+        # Explicitly remove the GroceryConciergeApp instance
+        if 'grocery_concierge_instance' in client_contexts[client_id]:
+            del client_contexts[client_id]['grocery_concierge_instance']
         time.sleep(2)  # Wait some time for the connection to close
         client_contexts.pop(client_id)
         print(f"Client context released for client {client_id}.")
@@ -563,8 +559,8 @@ def handleWsMessage(message):
 
         user_query = message.get('userQuery')
 
-        # Get response from GroceryConciergeApp
-        concierge_response = grocery_concierge_app.process_user_question(user_query)
+        # --- MODIFIED: Call client-specific GroceryConciergeApp instance ---
+        concierge_response = client_context['grocery_concierge_instance'].process_user_question(user_query)
 
         # Send the response in chunks (first the "Assistant: " prefix, then the actual response)
         socketio.emit("response", {'path': 'api.chat', 'chatResponse': 'Assistant: '}, room=client_id)
@@ -575,49 +571,15 @@ def handleWsMessage(message):
             speakWithQueue(concierge_response, 0, client_id)
         except Exception as e:
             print(f"Error in speaking response: {e}")
-#def handleWsMessage(message):
-#    client_id = uuid.UUID(message.get('clientId'))
-#    path = message.get('path')
-#    client_context = client_contexts[client_id]
-#    if path == 'api.audio':
-#        chat_initiated = client_context['chat_initiated']
-#       audio_chunk = message.get('audioChunk')
-#        audio_chunk_binary = base64.b64decode(audio_chunk)
-#        audio_input_stream = client_context['audio_input_stream']
-#        if audio_input_stream:
-#            audio_input_stream.write(audio_chunk_binary)
-#       if vad_iterator:
-#            audio_buffer = client_context['vad_audio_buffer']
-#            audio_buffer.extend(audio_chunk_binary)
-#           if len(audio_buffer) >= 1024:
-#                audio_chunk_int = np.frombuffer(bytes(audio_buffer[:1024]), dtype=np.int16)
-#                audio_buffer.clear()
-#                audio_chunk_float = int2float(audio_chunk_int)
-#                vad_detected = vad_iterator(torch.from_numpy(audio_chunk_float))
-#                if vad_detected:
-#                    print("Voice activity detected.")
-#                    stopSpeakingInternal(client_id, False)
-#    elif path == 'api.chat':
-#        chat_initiated = client_context['chat_initiated']
-#        if not chat_initiated:
-#            initializeChatContext(message.get('systemPrompt'), client_id)
-#            client_context['chat_initiated'] = True
-#       user_query = message.get('userQuery')
-#        first_response_chunk = True
-#        
-        # --- MODIFIED: Call your GroceryConciergeApp for response via WebSocket ---
-#        concierge_response = grocery_concierge_app.process_user_question(user_query)
-        
-#        if first_response_chunk:
-#            socketio.emit("response", {'path': 'api.chat', 'chatResponse': 'Assistant: '}, room=client_id)
-#            first_response_chunk = False
-#        socketio.emit("response", {'path': 'api.chat', 'chatResponse': concierge_response}, room=client_id)
-        # --- END MODIFIED ---
-
 
 # Initialize the client by creating a client id and an initial context
 def initializeClient() -> uuid.UUID:
     client_id = uuid.uuid4()
+    
+    # Initialize a new GroceryConciergeApp instance for this client
+    client_grocery_concierge_app = GroceryConciergeApp()
+    client_grocery_concierge_app.initialize_backend() # Initialize its backend components
+
     client_contexts[client_id] = {
         'audio_input_stream': None,  # Audio input stream for speech recognition
         'vad_audio_buffer': [],  # Audio input buffer for VAD
@@ -633,13 +595,15 @@ def initializeClient() -> uuid.UUID:
         'speech_token': None,  # Speech token for client side authentication with speech service
         'ice_token': None,  # ICE token for ICE/TURN/Relay server connection
         'chat_initiated': False,  # Flag to indicate if the chat context is initiated
-        'messages': [],  # Chat messages (history) - Note: This will no longer be used for LLM chat history by your backend
+        # Use 'messages' for client-side display history as it was already present
+        'messages': [],  # Chat messages (history) for client-side display
         'data_sources': [],  # Data sources for 'on your data' scenario - This will no longer be used by your backend
         'is_speaking': False,  # Flag to indicate if the avatar is speaking
         'speaking_text': None,  # The text that the avatar is speaking
         'spoken_text_queue': [],  # Queue to store the spoken text
         'speaking_thread': None,  # The thread to speak the spoken text queue
-        'last_speak_time': None  # The last time the avatar spoke
+        'last_speak_time': None,  # The last time the avatar spoke
+        'grocery_concierge_instance': client_grocery_concierge_app # Store the client-specific instance
     }
     return client_id
 
@@ -746,7 +710,7 @@ def initializeChatContext(system_prompt: str, client_id: uuid.UUID) -> None:
 
 # Handle the user query and return the assistant reply. For chat scenario.
 # The function is a generator, which yields the assistant reply in chunks.
-# --- MODIFIED: This function now calls your GroceryConciergeApp ---
+# --- MODIFIED: This function now calls your client-specific GroceryConciergeApp instance ---
 def handleUserQuery(user_query: str, client_id: uuid.UUID):
     client_context = client_contexts[client_id]
     
@@ -764,7 +728,7 @@ def handleUserQuery(user_query: str, client_id: uuid.UUID):
     # Call your integrated backend to process the user question
     # The `process_user_question` method in GroceryConciergeApp returns the final string answer.
     try:
-        concierge_response = grocery_concierge_app.process_user_question(user_query)
+        concierge_response = client_context['grocery_concierge_instance'].process_user_question(user_query)
         
         # Yield the response as a single chunk.
         # If your frontend expects streaming, you would need to modify
@@ -773,7 +737,6 @@ def handleUserQuery(user_query: str, client_id: uuid.UUID):
         yield concierge_response
 
         # Update chat history for display if needed (not for LLM input anymore)
-        # This part depends on how your frontend consumes the chat history.
         # client_context['messages'].append({'role': 'user', 'content': user_query})
         # client_context['messages'].append({'role': 'assistant', 'content': concierge_response})
 
@@ -896,11 +859,10 @@ iceTokenRefreshThread = threading.Thread(target=refreshIceToken)
 iceTokenRefreshThread.daemon = True
 iceTokenRefreshThread.start()
 
-# --- NEW: Main entry point to run the Flask app with SocketIO ---
+# --- MODIFIED: Main entry point to run the Flask app with SocketIO ---
 # This ensures the web server starts and listens for incoming requests.
 if __name__ == "__main__":
-    # Initialize the backend before starting the Flask app
-    initialize_grocery_concierge()
+    # REMOVED: Global initialization of the backend
+    # initialize_grocery_concierge()
     # Run the Flask app with SocketIO
     socketio.run(app, debug=True, allow_unsafe_werkzeug=True) # debug=True for development, allow_unsafe_werkzeug=True for older Werkzeug versions
-

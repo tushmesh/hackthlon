@@ -479,6 +479,9 @@ Answer in the precise and in a simple sentences and in a natural language
 Do NOT print in the output <think> </think> content , strictly just provide an answer 
 Answer the question clearly and directly. Do not include any internal thoughts or <think> tags.
 Also answer in such a way that, the text i.e answer can be translted to Speech.
+=== Chat History:
+{chat_history}
+
 Question: {question} 
 read this information: {data} answer to this question.
 Please provide an answer as shorter as possible.
@@ -488,7 +491,8 @@ Please use only the data which is been provided to answer the question.
 
 Answer:  
         """
-        return PromptTemplate(template=template, input_variables=["question", "data"])
+        #return PromptTemplate(template=template, input_variables=["question", "data"])
+        return PromptTemplate(template=template, input_variables=["chat_history", "question", "data"])
 
     def generate_sql_query(self, question: str, business_question_context: str, previous_query: str = None, previous_exception: str = None) -> str:
         """
@@ -510,12 +514,13 @@ Answer:
         })
         return extract_sql_query_from_llm_output(output)
 
-    def generate_chat_response(self, question: str, data: List[Any]) -> str:
+    def generate_chat_response(self, question: str, data: List[Any], chat_history: List[Dict[str, str]]) -> str:
         """
         Generates a conversational response based on the user's question and query results.
         Args:
             question (str): The user's natural language question.
             data (List[Any]): The data retrieved from the database.
+            chat_history (List[Dict[str, str]]):
         Returns:
             str: The conversational response.
         """
@@ -523,15 +528,16 @@ Answer:
         #chain = LLMChain(llm=self.chat_llm, prompt=self.chat_prompt_template)
         
         chat_chain = self.chat_prompt_template | self.chat_llm
+        full_response = ""
+
         # Use .stream() instead of .invoke()
-        #stream_iterator = chat_chain.stream({"question": question, "data": str(data)})
-        for chunk in chat_chain.stream({"question": question,"data": data} ):
+        for chunk in chat_chain.stream({"question": question, "data": data, "chat_history": chat_history}):
+            full_response += chunk
             print(chunk, end="", flush=True)
 
         chat_chain = self.chat_prompt_template | self.chat_llm
-        output = chat_chain.invoke({"question": question, "data": str(data)})
-        #output = "Hello"
-        return output
+        output = chat_chain.invoke({"question": question, "data": str(data), "chat_history": chat_history})
+        return full_response
 
 # --- Main Application Logic ---
 
@@ -621,10 +627,17 @@ class GroceryConciergeApp:
                     # If all retries fail, return an error message to the user
                     return "I apologize, but I encountered an issue while trying to retrieve that information. Please try rephrasing your question."
         
+        formatted_chat_history = ""
+        for message in self.chat_history:
+            formatted_chat_history += f"{message['role'].capitalize()}: {message['content']}\n"
+
         # Step 4: Generate conversational response
-        #final_answer = self.llm_service.generate_chat_response(user_question, db_results, self.chat_history)
-        final_answer = self.llm_service.generate_chat_response(user_question, db_results)
-        #self.chat_history.append({"role": "ai", "content": final_answer})
+        final_answer = self.llm_service.generate_chat_response(
+                question = user_question, 
+                data = db_results,
+                chat_history=formatted_chat_history
+        )
+        self.chat_history.append({"role": "ai", "content": final_answer})
         print(f"Final Answer: {final_answer}")
         return final_answer
 
